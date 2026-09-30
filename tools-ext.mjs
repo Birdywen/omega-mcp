@@ -526,6 +526,7 @@ export function omegaBatch(args, runProcess) {
     isError: false,
     text: `batch started: ${id} (${steps.length} steps)\n`
       + `Poll with omega_batch_status {"id":"${id}"}.`,
+    data: { jobId: id },
   });
 }
 
@@ -1472,7 +1473,8 @@ export function omegaEdit(args) {
     report.push(`undo point: ${batchId} (omega_undo {"batchId":"${batchId}"} to roll back ${landed.length} file(s))`);
   }
   const diffs = [...pending.values()].map((s) => `--- ${s.path} ---\n${s.spans && s.spans.length ? spanDiff(s.text, s.spans, dctx) : miniDiff(s.orig, s.text, dctx)}`);
-  return { isError: false, text: `edit: ${applied}/${list.length} ${dry ? 'verified (DRY-RUN, NOTHING WRITTEN)' : 'applied (two-phase commit)'}\n${report.join('\n')}\n\n${diffs.join('\n\n')}`.slice(0, EDIT_TOTAL_CAP) };
+  return { isError: false, text: `edit: ${applied}/${list.length} ${dry ? 'verified (DRY-RUN, NOTHING WRITTEN)' : 'applied (two-phase commit)'}\n${report.join('\n')}\n\n${diffs.join('\n\n')}`.slice(0, EDIT_TOTAL_CAP),
+    data: { batchId: dry ? null : batchId, dryRun: dry, applied } };
 }
 
 export const EXTRA_TOOLS = [

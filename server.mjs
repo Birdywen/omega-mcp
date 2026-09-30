@@ -16,6 +16,7 @@ import {
   vfsLocalWrite, dbQuery, omegaBatch, omegaBatchStatus, omegaBatchCancel, omegaRead,
   omegaGuardCheck, omegaGrep, omegaQuota, omegaHealth, omegaSqlite, omegaEdit, omegaUndo, EXTRA_TOOLS,
 } from './tools-ext.mjs';
+import { createFlowRuntime, FLOW_TOOL } from './omega-flow.mjs';
 
 const ART_DIR = process.env.OMEGA_ARTIFACT_DIR
   || path.join(homedir(), 'workspace/genspark-agent/server-v2/data/artifacts');
@@ -206,9 +207,12 @@ const TOOLS = [
 // primary-only rule for writes lives in the prompts, not in code.
 // To take one back, remove its name from this set rather than restoring code.
 const OMEGA_ADVERTISE = new Set(["omega_batch", "omega_batch_status", "omega_batch_cancel", "omega_read", "artifact_read", "artifact_search", "db_query", "omega_guard_check", "omega_grep", "omega_quota", "omega_health", "vfs_local_write", "omega_sqlite", "omega_edit", "omega_undo"]);
-const ALL_TOOLS = [...TOOLS, ...EXTRA_TOOLS].filter((t) => OMEGA_ADVERTISE.has(t.name));
+OMEGA_ADVERTISE.add('omega_flow');
+const ALL_TOOLS = [...TOOLS, ...EXTRA_TOOLS, FLOW_TOOL].filter((t) => OMEGA_ADVERTISE.has(t.name));
+const omegaFlow = createFlowRuntime(callTool, { allowEffects: process.env.OMEGA_FLOW_ALLOW_EFFECTS === '1' });
 
 async function callTool(name, args) {
+  if (name === 'omega_flow') return omegaFlow(args || {});
   if (name === 'run_process') return runProcess(args || {});
 
   if (name === 'vfs_local_write') return vfsLocalWrite(args || {});
