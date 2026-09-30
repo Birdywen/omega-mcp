@@ -38,6 +38,8 @@ Zero npm dependencies. `node >= 20`.
 | `OMEGA_DB`           | Mac agent.db | Oracle agent.db | Database `db_query` reads/writes |
 | `OMEGA_QUOTA_SCRIPT` | giz-quota.sh | — | Absent = `omega_quota` degrades to a pointer |
 | `OMEGA_JOB_DIR` / `OMEGA_ARTIFACT_DIR` / `OMEGA_CWD` | per host | per host | Scratch locations |
+| `OMEGA_DB_BACKUP_KEEP` | 10 | n/a | Snapshots kept; `0` disables pruning |
+| `OMEGA_FORCE_GREP` | unset | n/a | `1` pins omega_grep to the grep fallback |
 
 Batch shells get `/opt/homebrew/bin` + `/usr/local/bin` prepended to PATH
 (`withToolPath` in `server.mjs`); a caller-supplied PATH still wins.
@@ -48,3 +50,33 @@ Batch shells get `/opt/homebrew/bin` + `/usr/local/bin` prepended to PATH
 - After pulling new code, **restart the host agent** — the MCP server loads
   code once at startup; re-testing on a stale process spins forever.
 - Never commit host paths, secrets, or `.bak` files.
+
+## Host PATH is minimal — the module fixes it for itself
+
+GenCode launches the server with `bundled-resources/bin` + system dirs and no
+Homebrew prefix, so a bare `rg` probe fails even though ripgrep is installed.
+`tools-ext.mjs` prepends `/opt/homebrew/bin:/usr/local/bin` to its own
+`process.env.PATH` at import time, so every binary probe in the module (`rg`,
+`sqlite3`, `python3`) resolves. `server.mjs:withToolPath()` does the same for
+batch child shells; an explicit `environment.PATH` still wins.
+
+If `omega_health` reports ripgrep absent, it now prints the PATH it searched.
+
+## omega_grep engine parity
+
+`rg` is the primary engine; `grep -E` is the fallback for hosts without it
+(Oracle). Both must answer identically — the fallback runs `-E` because plain
+BRE treats `a|b` as a literal pipe and returns "(no matches)" for a file that
+contains both, which reads exactly like "not there". `tools-ext.test.mjs` pins
+the two engines against the same inputs and fails on any divergence. Set
+`OMEGA_FORCE_GREP=1` to exercise the fallback on a host that has `rg`.
+
+## db snapshot retention
+
+Every fenced write copies the whole database (69 MB here), so snapshots are
+pruned to the newest `OMEGA_DB_BACKUP_KEEP` (default 10). A snapshot is
+collapsed out of WAL mode so it is a single self-contained file, and the
+rollback line in the receipt removes the live `-wal`/`-shm` before restoring —
+copying over a live WAL database leaves stale pages that SQLite replays on the
+next open. `OMEGA_DB_BACKUP_KEEP=0` disables pruning.
+

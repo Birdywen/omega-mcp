@@ -2,13 +2,33 @@
 // omega_batch runner. Kept in a separate module so server.mjs stays readable;
 // imported dynamically so a failure here cannot stop run_process.
 
-import { writeFileSync, mkdirSync, readFileSync, existsSync, statSync, copyFileSync, rmSync, renameSync, chmodSync, linkSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, existsSync, statSync, copyFileSync, rmSync, renameSync, chmodSync, linkSync, readdirSync } from 'node:fs';
 import { spawn, execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { guardSteps, inspectCommand } from './batch-guard.mjs';
+
+// ---------- tool PATH (self-healing, runs before anything probes a binary) ----------
+// GenCode launches this server with a minimal PATH (bundled-resources/bin, the
+// system dirs) that has no Homebrew prefix, so `rg` — installed at
+// /opt/homebrew/bin/rg — probed as absent and omega_grep silently fell back to
+// grep. Fallback then broke regex semantics too (BRE has no `|`), so
+// `omega_grep pattern:"a|b"` returned "(no matches)" on a file that contains
+// both, with exit 1 and no error. Found 2026-09-30 by probing the live server.
+// Fixing it here, at module load, so EVERY binary probe in this file (rg,
+// sqlite3, python3) sees the same PATH the batch shells already got.
+const TOOL_DIRS = ['/opt/homebrew/bin', '/usr/local/bin'];
+const pathSep = process.platform === 'win32' ? ';' : ':';
+{
+  const cur = (process.env.PATH || '').split(pathSep).filter(Boolean);
+  const extra = TOOL_DIRS.filter((d) => !cur.includes(d));
+  if (extra.length) process.env.PATH = [...extra, ...cur].join(pathSep);
+}
+// A caller-supplied PATH still wins: withToolPath() in server.mjs prepends the
+// same dirs to the child env, and explicit `environment.PATH` overrides this.
+export function toolPathExtras() { return TOOL_DIRS; }
 
 const DB = process.env.OMEGA_DB
   || path.join(homedir(), 'workspace/genspark-agent/server-v2/data/agent.db');
@@ -214,13 +234,56 @@ function spawnSyncLite(bin, argv) {
   return { ok: r.status === 0, error: (r.stderr || '').trim() || null, out: r.stdout || '' };
 }
 
+// Every fenced write copies the WHOLE database (69 MB here), so an unbounded
+// snapshot dir filled 139 MB from two writes on 2026-09-30. Retention is part
+// of the fence, not an afterthought: keep the newest N (default 10, ~700 MB
+// worst case) and prune older ones after a successful snapshot. Never prune the
+// snapshot just taken -- the rollback path in the receipt must stay valid for
+// the whole turn. OMEGA_DB_BACKUP_KEEP=0 disables retention entirely.
+const DB_BACKUP_KEEP = Number.isFinite(Number(process.env.OMEGA_DB_BACKUP_KEEP))
+  ? Number(process.env.OMEGA_DB_BACKUP_KEEP) : 10;
+
+function pruneDbBackups() {
+  if (DB_BACKUP_KEEP <= 0) return { pruned: 0 };
+  let files;
+  try {
+    files = readdirSync(DB_BACKUP_DIR)
+      .filter((f) => /^agent-.*\.db(-wal|-shm)?$/.test(f))
+      .sort(); // ISO-8601 stamps sort lexicographically = oldest first
+  } catch { return { pruned: 0 }; }
+  // Count whole snapshots, not files: a -wal/-shm sidecar is part of its
+  // snapshot, and the source db is in WAL mode so every snapshot can leave a
+  // pair behind. Counting files separately would let a pruned snapshot's
+  // sidecars (163 KB of -shm observed) sit in the dir forever.
+  const stems = new Set(files.map((f) => f.replace(/-(wal|shm)$/, '')));
+  const ordered = [...stems].sort();
+  const excess = ordered.length - DB_BACKUP_KEEP;
+  if (excess <= 0) return { pruned: 0 };
+  const doomed = new Set(ordered.slice(0, excess));
+  let pruned = 0;
+  for (const f of files) {
+    if (!doomed.has(f.replace(/-(wal|shm)$/, ''))) continue;
+    try { rmSync(path.join(DB_BACKUP_DIR, f)); pruned++; } catch { /* best effort */ }
+  }
+  return { pruned, kept: DB_BACKUP_KEEP };
+}
+
 function dbBackup(tag) {
   mkdirSync(DB_BACKUP_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, 'Z');
   const dest = path.join(DB_BACKUP_DIR, `agent-${stamp}-${tag}.db`);
   const r = spawnSyncLite('sqlite3', [DB, `.backup ${dest}`]);
   if (!r.ok) return { ok: false, dest, error: r.error };
-  return { ok: true, dest };
+  // Collapse the snapshot out of WAL mode. The source db is WAL, so .backup
+  // leaves a -wal beside the snapshot; the receipt tells the caller to roll back
+  // with a plain `cp snapshot.db live.db`, and a cp that ignores a non-empty -wal
+  // silently restores a stale database. One self-contained file makes that
+  // command true. This is the whole reason .backup is used over cp.
+  spawnSyncLite('sqlite3', [dest, 'PRAGMA journal_mode=DELETE;']);
+  for (const sidecar of [`${dest}-wal`, `${dest}-shm`]) {
+    try { rmSync(sidecar, { force: true }); } catch { /* best effort */ }
+  }
+  return { ok: true, dest, ...pruneDbBackups() };
 }
 
 // dbfile.cjs is a node script, but the .backup CLI is the only snapshot that is
@@ -335,7 +398,14 @@ export function dbQuery(args) {
       text: `db_query WRITE ok=${!r.isError} tables=[${touched.join(', ')}]\n`
         + `snapshot: ${bak.dest}\nrowcount: ${delta || '(n/a)'}\n`
         + `integrity: ${ic.verdict}${ic.via ? ` (via ${ic.via})` : ''}\n`
-        + `rollback: cp ${JSON.stringify(bak.dest)} ${DB}\n\n${r.text}`,
+        // Not a bare `cp`: the live db is in WAL mode, so copying a file over it
+        // leaves the old -wal/-shm beside the new file and SQLite replays stale
+        // pages on next open -- a rollback that appears to work and does not.
+        // The sidecars must go, and the restored copy must be checkpointed.
+        + `rollback: rm -f ${DB}-wal ${DB}-shm && cp ${JSON.stringify(bak.dest)} ${DB} `
+        + `&& sqlite3 ${DB} "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;"`
+        + (bak.pruned ? `\nretention: pruned ${bak.pruned} old file(s), keeping ${bak.kept}` : '')
+        + `\n\n${r.text}`,
     };
   });
 }
@@ -746,7 +816,7 @@ const GREP_CAPTURE_CAP = 250000;
 // an error, so name the near-misses and refuse instead of guessing.
 const GREP_ALIASES = { path: 'dir', file: 'include', glob: 'include' };
 
-export function omegaGrep(args) {
+export function omegaGrep(args, opts = {}) {
   const pattern = args.pattern;
   if (!pattern) return Promise.resolve({ isError: true, text: 'pattern is required' });
   const wrong = Object.keys(GREP_ALIASES).filter((k) => args[k] !== undefined);
@@ -773,7 +843,15 @@ export function omegaGrep(args) {
   const excludes = asList(args.exclude).filter((v) => typeof v === 'string' && v);
   return new Promise((resolve) => {
     let useRg = false;
-    try { execFileSync('rg', ['--version'], { stdio: 'ignore' }); useRg = true; } catch { /* fallback */ }
+    // OMEGA_FORCE_GREP=1 exercises the fallback on a host that has rg. The two
+    // engines must answer identically, so being able to pin the slow path is
+    // what makes that claim testable instead of a hope -- and it is the only way
+    // to reproduce an Oracle-side regex bug from the Mac. `opts.forceGrep` is the
+    // in-process form used by the parity test (env is read at spawn time only).
+    const forceGrep = opts.forceGrep === true || process.env.OMEGA_FORCE_GREP === '1';
+    if (!forceGrep) {
+      try { execFileSync('rg', ['--version'], { stdio: 'ignore' }); useRg = true; } catch { /* fallback */ }
+    }
     let cmd, cmdArgs;
     if (useRg) {
       cmdArgs = ['--line-number', '--no-heading', '--color=never', '-e', pattern];
@@ -787,7 +865,13 @@ export function omegaGrep(args) {
       cmdArgs.push('--', dir);
       cmd = 'rg';
     } else {
-      cmdArgs = ['-rn', '-I'];
+      // -E is mandatory, not an optimization: the documented contract is "regex
+      // (rg) / pattern (grep fallback)", and the tool description promises rg
+      // semantics. Without -E, grep applies BRE, where `a|b` is a literal pipe:
+      // the call returns "(no matches)" and exit 1 for a file that DOES contain
+      // both alternatives. A silent wrong answer is worse than an error, so the
+      // fallback must speak the same regex dialect as the primary path.
+      cmdArgs = ['-rn', '-I', '-E'];
       if (args.ignoreCase) cmdArgs.push('-i');
       if (args.literal) cmdArgs.push('-F');
       if (args.word) cmdArgs.push('-w');
@@ -912,7 +996,13 @@ export function omegaHealth() {
   lines.push(`  [${existsSync(db) ? 'ok' : '--'}] agent db: ${existsSync(db) ? db : 'absent (db_query degrades gracefully)'}`);
   let rg = false;
   try { execFileSync('rg', ['--version'], { stdio: 'ignore' }); rg = true; } catch { /* fallback */ }
-  lines.push(`  [${rg ? 'ok' : '--'}] ripgrep: ${rg ? 'present (omega_grep full speed)' : 'absent (omega_grep uses grep fallback)'}`);
+  // Name the searched PATH and the dirs we would add: "absent" alone sent the
+  // 2026-09-30 investigation down a wrong path (assumed rg uninstalled) when
+  // the real cause was the server's minimal PATH.
+  lines.push(`  [${rg ? 'ok' : '--'}] ripgrep: ${rg ? 'present (omega_grep full speed)'
+    : `absent -> omega_grep uses the grep -E fallback (ERE, same dialect); searched PATH=${
+      (process.env.PATH || '(unset)').split(pathSep).join(': ')}; add ${
+      TOOL_DIRS.filter((d) => !(process.env.PATH || '').split(pathSep).includes(d)).join(', ') || '(already on PATH)'}`}`);
   const q = process.env.OMEGA_QUOTA_SCRIPT || path.join(homedir(), '.config/gencode/scripts/giz-quota.sh');
   lines.push(`  [${existsSync(q) ? 'ok' : '--'}] quota script: ${existsSync(q) ? q : 'absent (omega_quota points at Mac)'}`);
   lines.push(`  extras loaded: ${EXTRA_TOOLS.length} tool definitions`);

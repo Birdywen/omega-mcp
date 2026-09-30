@@ -5,8 +5,10 @@
 //
 // Run: node mcp/tools-ext.test.mjs
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, statSync, chmodSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { inspectCommand } from './batch-guard.mjs';
 import {
@@ -273,6 +275,43 @@ const scratch = mkdtempSync(path.join(tmpdir(), 'omega-tools-test-'));
   writeFileSync(excludedFile, 'EXCLUDE_MARKER\n');
   const excluded = await omegaGrep({ pattern: 'EXCLUDE_MARKER', dir: scratch, exclude: ['excluded.txt'] });
   ok(!excluded.isError && excluded.text.includes('(no matches)'), 'omega_grep exclude globs must suppress matching files: ' + excluded.text);
+
+  // ---- regression 2026-09-30: the fallback silently downgraded to BRE ----
+  // The grep branch ran without -E, so `alpha|beta` was a literal pipe and the
+  // call answered "(no matches)" for a file containing both words -- a wrong
+  // answer with exit 1 and no error, which reads exactly like "not there".
+  // Every other grep test above used a literal needle, so the suite stayed
+  // green while the bug was live. These assertions pin the DIALECT, and they
+  // must hold on the rg path and the grep path alike.
+  const dialect = path.join(scratch, 'dialect.txt');
+  writeFileSync(dialect, 'alpha\nbeta\ngamma\n');
+  const alternation = await omegaGrep({ pattern: 'alpha|beta', dir: scratch, include: 'dialect.txt' });
+  ok(!alternation.isError && alternation.text.includes('dialect.txt'),
+    'omega_grep must treat | as alternation (ERE), not a literal pipe: ' + alternation.text);
+  const group = await omegaGrep({ pattern: '(alpha|beta)$', dir: scratch, include: 'dialect.txt' });
+  ok(!group.isError && group.text.includes('dialect.txt'),
+    'omega_grep must support grouping parens: ' + group.text);
+  const plus = await omegaGrep({ pattern: 'alph+', dir: scratch, include: 'dialect.txt' });
+  ok(!plus.isError && plus.text.includes('dialect.txt'),
+    'omega_grep must support + as a repetition operator: ' + plus.text);
+  // The summary must always name the engine, so a reader can tell which
+  // semantics produced the answer.
+  ok(/via (rg|grep)/.test(alternation.text), 'omega_grep must name its engine in the summary: ' + alternation.text);
+
+  // ---- engine parity: the two backends must answer IDENTICALLY ----
+  // Oracle has no ripgrep, so every regex there runs on the grep fallback. If
+  // the branches can disagree, a pattern that works on the Mac silently
+  // returns nothing on Oracle -- the exact class of bug this section is about.
+  // Pin both engines on the same inputs and compare the match sets.
+  const parities = ['alpha|beta', '(alpha|beta)$', 'alph+', 'a.p', 'zzz|nomatch', '^gamma$'];
+  for (const pat of parities) {
+    const viaRg = await omegaGrep({ pattern: pat, dir: scratch, include: 'dialect.txt' }, { forceGrep: false });
+    const viaGrep = await omegaGrep({ pattern: pat, dir: scratch, include: 'dialect.txt' }, { forceGrep: true });
+    const normalize = (t) => t.split('\n').filter((l) => l.includes('dialect.txt:')).join('\n');
+    ok(normalize(viaRg.text) === normalize(viaGrep.text),
+      `omega_grep engines must agree on /${pat}/ (rg and grep -E):\n  rg:   ${normalize(viaRg.text) || '(none)'}\n  grep: ${normalize(viaGrep.text) || '(none)'}`);
+    ok(viaGrep.text.includes('via grep'), 'forced fallback must report the grep engine: ' + viaGrep.text);
+  }
 }
 
 // ---- db_query dryRun must NOT write (write-enabled build only) ----
@@ -378,6 +417,29 @@ if (dbWriteEnabled) {
 ok(!inspectCommand('echo x > /etc/x').ok, 'guard must still refuse an absolute redirect');
 ok(inspectCommand('node -e "x => x"').ok, 'guard must allow an arrow function');
 ok(inspectCommand('echo x > /tmp/f').ok, 'guard must allow /tmp');
+
+// ---- the tool PATH self-heal, exercised under the PATH that actually broke it ----
+// GenCode's server env is bundled-resources/bin + system dirs, with no Homebrew
+// prefix, so every `rg` probe failed. Assert the invariant directly rather than
+// trusting the ambient shell: importing the module under a stripped PATH must
+// still leave the tool dirs reachable. This runs in a child because the parent
+// already fixed its own PATH at import time.
+{
+  const probe = `
+    const { toolPathExtras } = await import(${JSON.stringify(path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools-ext.mjs'))});
+    const sep = ':';
+    const cur = (process.env.PATH || '').split(sep);
+    const missing = toolPathExtras().filter((d) => !cur.includes(d));
+    console.log(missing.length === 0 ? 'PATH-HEALED' : 'PATH-MISSING:' + missing.join(','));
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: '/Users/yay/Library/Application Support/ai.mainfunc.genspark.terminal/bundled-resources/bin:/usr/bin:/bin:/usr/sbin:/sbin' },
+  });
+  const out = `${r.stdout || ''}${r.stderr || ''}`;
+  ok(out.includes('PATH-HEALED'),
+    'importing tools-ext under a minimal PATH must still expose the tool dirs (rg/sqlite3 probes): ' + out.trim());
+}
 
 rmSync(scratch, { recursive: true, force: true });
 
