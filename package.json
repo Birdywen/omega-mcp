@@ -1,0 +1,14 @@
+{
+  "name": "@birdywen/omega-mcp",
+  "version": "1.0.0",
+  "description": "Omega MCP bridge: batch/read/grep/edit/quota/health tools for GenCode and opencode. Single source of truth for Mac and Oracle.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node batch-guard.test.mjs && node tools-ext.test.mjs",
+    "test:guard": "node batch-guard.test.mjs",
+    "test:tools": "node tools-ext.test.mjs"
+  }
+}
