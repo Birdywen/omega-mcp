@@ -11,6 +11,9 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { inspectCommand } from './batch-guard.mjs';
+// Spawned children import the module by absolute path, so the argv-trace and
+// PATH-heal probes below do not depend on this file's own import cache.
+const TOOLS_EXT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools-ext.mjs');
 import {
   vfsLocalWrite, omegaBatch, omegaBatchStatus, omegaBatchCancel,
   omegaEdit, omegaUndo, omegaRead, omegaGrep, dbQuery, EXTRA_TOOLS,
@@ -426,7 +429,7 @@ ok(inspectCommand('echo x > /tmp/f').ok, 'guard must allow /tmp');
 // already fixed its own PATH at import time.
 {
   const probe = `
-    const { toolPathExtras } = await import(${JSON.stringify(path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools-ext.mjs'))});
+    const { toolPathExtras } = await import(${JSON.stringify(TOOLS_EXT)});
     const sep = ':';
     const cur = (process.env.PATH || '').split(sep);
     const missing = toolPathExtras().filter((d) => !cur.includes(d));
@@ -439,6 +442,42 @@ ok(inspectCommand('echo x > /tmp/f').ok, 'guard must allow /tmp');
   const out = `${r.stdout || ''}${r.stderr || ''}`;
   ok(out.includes('PATH-HEALED'),
     'importing tools-ext under a minimal PATH must still expose the tool dirs (rg/sqlite3 probes): ' + out.trim());
+  // ---- regression 2026-09-30 (Oracle pull): never pass two matcher flags ----
+  // Passing `-E -F` together is accepted by BSD grep (last wins -> literal works)
+  // and REJECTED by GNU grep >= 3.7 ("conflicting matchers", exit 2). A Mac-only
+  // suite cannot see that: it asserts on output, and on the Mac the output is
+  // correct. So assert on the ARGV. One matcher flag, always.
+  const argvFor = async (grepArgs) => {
+    const script = `
+      const m = await import(${JSON.stringify(TOOLS_EXT)});
+      await m.omegaGrep(${JSON.stringify(grepArgs)}, { forceGrep: true });    `;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, OMEGA_GREP_TRACE: '1' },
+    });
+    const m = `${r.stderr || ''}`.match(/OMEGA_GREP_TRACE (\[.*\])/);
+    ok(!!m, `omega_grep must trace its argv for: ${JSON.stringify(grepArgs)}\n${r.stderr}`);
+    return m ? JSON.parse(m[1]) : [];
+  };
+  const matcherFlags = (argv) => argv.filter((a) => a === '-E' || a === '-F' || a === '-G' || a === '-P');
+  for (const [label, grepArgs] of [
+    ['plain regex', { pattern: 'alpha|beta', dir: scratch, include: 'dialect.txt' }],
+    ['literal', { pattern: 'value[one]', dir: scratch, include: 'dialect.txt', literal: true }],
+    ['literal+word', { pattern: 'needle', dir: scratch, include: 'dialect.txt', literal: true, word: true }],
+    ['word only', { pattern: 'needle', dir: scratch, include: 'dialect.txt', word: true }],
+    ['ignoreCase', { pattern: 'ALPHA', dir: scratch, include: 'dialect.txt', ignoreCase: true }],
+  ]) {
+    const argv = await argvFor(grepArgs);
+    const flags = matcherFlags(argv);
+    ok(flags.length === 1,
+      `grep fallback must pass exactly ONE matcher flag (${label}), got [${flags}] in: ${argv.join(' ')}`);
+    if (grepArgs.literal) {
+      ok(flags[0] === '-F', `literal mode must use -F and drop -E (${label}), got [${flags}]`);
+    } else {
+      ok(flags[0] === '-E', `regex mode must use -E (${label}), got [${flags}]`);
+    }
+    if (grepArgs.word) ok(argv.includes('-w'), `word mode must still pass -w (${label}): ${argv.join(' ')}`);
+  }
 }
 
 rmSync(scratch, { recursive: true, force: true });

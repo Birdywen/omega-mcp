@@ -871,9 +871,17 @@ export function omegaGrep(args, opts = {}) {
       // the call returns "(no matches)" and exit 1 for a file that DOES contain
       // both alternatives. A silent wrong answer is worse than an error, so the
       // fallback must speak the same regex dialect as the primary path.
-      cmdArgs = ['-rn', '-I', '-E'];
-      if (args.ignoreCase) cmdArgs.push('-i');
+      //
+      // Exactly ONE matcher flag, never both. GNU grep >= 3.7 treats `-E -F` as
+      // "conflicting matchers specified" and exits 2, while BSD grep silently
+      // lets the last one win. Passing both therefore made literal:true work on
+      // the Mac and fail on Oracle -- found 2026-09-30 by the Oracle pull, and
+      // invisible to a Mac-only suite. -F already implies fixed strings, so
+      // literal mode drops -E entirely; -w composes with either.
+      cmdArgs = ['-rn', '-I'];
       if (args.literal) cmdArgs.push('-F');
+      else cmdArgs.push('-E');
+      if (args.ignoreCase) cmdArgs.push('-i');
       if (args.word) cmdArgs.push('-w');
       if (before) cmdArgs.push('-B', String(before));
       if (after) cmdArgs.push('-A', String(after));
@@ -887,6 +895,14 @@ export function omegaGrep(args, opts = {}) {
       cmd = 'grep';
     }
     const child = spawn(cmd, cmdArgs, { cwd: baseDir });
+    if (process.env.OMEGA_GREP_TRACE === '1') {
+      // Escape hatch for asserting on the exact argv across platforms. The
+      // suite's output assertions cannot see this class of bug: BSD grep
+      // tolerates a flag combination GNU grep rejects, so the same call passes
+      // on the Mac and fails on Oracle. Dumping argv makes the difference
+      // assertable in one place instead of re-discovered per host.
+      process.stderr.write(`OMEGA_GREP_TRACE ${JSON.stringify([cmd, ...cmdArgs])}\n`);
+    }
     let out = '';
     let err = '';
     let captureTruncated = false;

@@ -65,11 +65,19 @@ If `omega_health` reports ripgrep absent, it now prints the PATH it searched.
 ## omega_grep engine parity
 
 `rg` is the primary engine; `grep -E` is the fallback for hosts without it
-(Oracle). Both must answer identically — the fallback runs `-E` because plain
-BRE treats `a|b` as a literal pipe and returns "(no matches)" for a file that
-contains both, which reads exactly like "not there". `tools-ext.test.mjs` pins
-the two engines against the same inputs and fails on any divergence. Set
-`OMEGA_FORCE_GREP=1` to exercise the fallback on a host that has `rg`.
+(Oracle). Two rules keep them honest:
+
+- **The fallback speaks ERE.** Plain BRE treats `a|b` as a literal pipe and
+  returns "(no matches)" for a file containing both — a silent wrong answer
+  that reads exactly like "not there".
+- **Exactly one matcher flag, never two.** GNU grep ≥ 3.7 rejects `-E -F` as
+  "conflicting matchers" (exit 2) while BSD grep silently lets the last win, so
+  passing both works on the Mac and fails on Oracle.
+
+Output assertions cannot catch the second class: on a tolerant platform the
+output is correct. `OMEGA_GREP_TRACE=1` dumps the exact argv, and the suite
+asserts on that — so a Mac-only run still catches what would fail on Linux.
+Set `OMEGA_FORCE_GREP=1` to exercise the fallback on a host that has `rg`.
 
 ## db snapshot retention
 
