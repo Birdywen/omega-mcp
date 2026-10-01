@@ -18,7 +18,7 @@ KEYS = ('passed', 'failures', 'outputPath', 'path', 'duration', 'width', 'height
 
 def pick(d):
     found = {}
-    for src in (d, d.get('result') if isinstance(d.get('result'), dict) else None):
+    for src in (d, d.get('analysis'), d.get('result')):
         if isinstance(src, dict):
             for k in KEYS:
                 if k in src and k not in found:
@@ -66,6 +66,8 @@ def main():
         for k, v in pick(data).items():
             print('%s: %s' % (k, json.dumps(v, ensure_ascii=False)[:400]))
         if pick(data).get('passed') is False:
+            ok = False
+        if data.get('isError') is True:
             ok = False
     else:
         print('raw: ' + body[:400].replace(chr(10), ' '))
