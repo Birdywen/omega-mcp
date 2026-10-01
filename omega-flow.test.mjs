@@ -198,6 +198,51 @@ test('ref contract: tool step is .text, .data only when the tool returned one or
   assert.equal(r4.data.state, 'success');
 });
 
+test('cancel frees capacity: finished flows at once, running flows when they stop', async () => {
+  // A cancelled flow must stop occupying a slot, or 16 flows lock out omega_flow
+  // for the whole TTL window and cancel is useless as a reclaim.
+  const settled = () => ({ isError: false, text: 'done' });
+  const flow = createFlowRuntime(settled, { maxJobs: 2 });
+
+  // --- finished flow: slot back immediately
+  const a = await flow({ steps: [{ id: 'a', tool: 'omega_health' }] });
+  await flow({ steps: [{ id: 'a', tool: 'omega_health' }] });
+  assert.equal((await flow({ steps: [{ id: 'a', tool: 'omega_health' }] })).data.state, 'rejected');
+  const c1 = await flow({ action: 'cancel', id: a.data.id });
+  assert.equal(c1.data.id, a.data.id, 'cancel still returns the snapshot');
+  assert.equal((await flow({ steps: [{ id: 'a', tool: 'omega_health' }] })).data.state, 'success',
+    'cancelling a FINISHED flow frees its slot at once');
+  // maxJobs=2 and exactly one slot was freed, so precisely one more start fits --
+  // which also proves the cap itself still holds after the fix.
+  assert.equal((await flow({ steps: [{ id: 'a', tool: 'omega_health' }] })).data.state, 'rejected',
+    'the reclaimed slot is consumed by that start; the ceiling is not weakened');
+
+  // --- a cancelled flow is no longer addressable, and says so clearly
+  const gone = await flow({ action: 'status', id: a.data.id });
+  assert.equal(gone.data.state, 'rejected');
+  assert.match(gone.data.error, /unknown or expired flow/);
+
+  // --- running flow: keeps its slot until it actually stops
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const slow = createFlowRuntime(async () => { await gate; return settled(); }, { maxJobs: 1 });
+  // waitMs:0 returns a running handle immediately; the default would block the
+  // full 20s on the gate we are deliberately holding shut.
+  const b = await slow({ steps: [{ id: 'a', tool: 'omega_health' }], waitMs: 0 });
+  assert.equal(b.data.state, 'running');
+  assert.equal((await slow({ steps: [{ id: 'a', tool: 'omega_health' }] })).data.state, 'rejected',
+    'a RUNNING flow still holds its slot, so in-flight work stays tracked');
+  await slow({ action: 'cancel', id: b.data.id });
+  assert.equal((await slow({ steps: [{ id: 'a', tool: 'omega_health' }] })).data.state, 'rejected',
+    'cancel alone does not free a slot while the tool call is still in flight');
+  release();
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal((await slow({ steps: [{ id: 'a', tool: 'omega_health' }] })).data.state, 'success',
+    'the slot comes back once the cancelled flow actually stops');
+  release();
+});
+
 test('advertised description documents the real ref contract', () => {
   // Guards the doc/contract drift directly: the MCP description is what the
   // model reads, so a wrong example here is a real production bug.

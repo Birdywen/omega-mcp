@@ -107,15 +107,17 @@
 ## 异步、资源限制与加载
 
 - `{"action":"status","id":"flow-...","waitMs":20000,"verbose":true}` 查询。
-- `{"action":"cancel","id":"flow-..."}` 请求取消，仅阻止后续步骤，不杀当前工具。
-  **取消不释放名额** —— 已取消的 flow 仍占用名额直到 30 分钟过期。
+- `{"action":"cancel","id":"flow-..."}` 请求取消，仅阻止后续步骤，不杀当前工具或已启动的 batch。
+  **取消会释放名额**：已结束的 flow 立刻释放；仍在运行的 flow 等它真正停下来再释放，
+  这样正在飞行中的工具调用始终被计数，不会因为取消而失控。被取消的 flow 之后不能再按 id
+  查询（`unknown or expired flow`），最终状态和全部步骤结果已在 cancel 的返回里。
 - 默认等待 20 秒、最多 50 秒；到时返回 running 和真实 ID。进程内顺序执行，等待不忙轮询。
 - 每条最多 32 步；输入、正常保留数据和单次变量展开预算分别为 256 KB，另含有界诊断元数据；JSON 深度最多 24。
   超限可能发生在底层操作完成后，应查看实际文件或 batch，不能当作自动撤销。
-- 最多保留 16 条 flow，完成后 30 分钟过期。结果仅在 MCP 进程内存；重启后无法恢复。
-  **因为 cancel 不释放名额，开满 16 条后到过期前所有新 flow 都会被拒**
-  （`flow capacity reached; completed jobs expire after 30 minutes`）。
-  需要放宽就在 MCP 进程环境设 `OMEGA_FLOW_MAX_JOBS=<1..1024 的整数>` 后重启；
+- 最多保留 `OMEGA_FLOW_MAX_JOBS`（默认 16）条 flow，完成后 30 分钟过期。结果仅在 MCP 进程内存；重启后无法恢复。
+  开满后到过期前新 flow 都会被拒（`flow capacity reached; completed jobs expire after 30 minutes`），
+  **此时 cancel 掉不要的 flow 即可回收名额**，不必等 30 分钟。
+  需要整体放宽就在 MCP 进程环境设 `OMEGA_FLOW_MAX_JOBS=<1..1024 的整数>` 后重启；
   留空或设成非法值（0、负数、小数、非数字、超范围）一律回落到 16，**不会静默取消上限**。
   默认返回摘要；`verbose:true` 返回保留的完整步骤结果。工具自己截断的文本不会被恢复。
 - 修改已在磁盘，**重启 OpenCode/MCP 后才会出现工具**。先确保没有运行中的 flow/batch。

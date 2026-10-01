@@ -251,7 +251,19 @@ export function createFlowRuntime(dispatch, { allowEffects = false, maxJobs = 16
         if (Object.keys(args).some((key) => !['action', 'id', 'waitMs', 'verbose'].includes(key))) throw Error('unknown field in flow control request');
         job = jobs.get(args.id);
         if (!job) throw Error('unknown or expired flow; running flows do not survive MCP restart');
-        if (action === 'cancel' && job.state === 'running') job.cancelRequested = true;
+        if (action === 'cancel') {
+          // Cancel has to actually free capacity, otherwise a session that opens
+          // maxJobs flows is locked out until the 30-minute TTL sweep and cancel
+          // is useless as a reclaim. Deleting a still-running job here would
+          // untrack a tool call that is mid-flight, so a running flow keeps its
+          // slot until it really stops; a finished one is reclaimed at once.
+          if (job.state === 'running') {
+            job.cancelRequested = true;
+            job.promise.then(() => jobs.delete(job.id));
+          } else {
+            jobs.delete(job.id);
+          }
+        }
       }
       const wait = args.waitMs ?? (action === 'cancel' ? 0 : 20000);
       if (job.state === 'running' && wait) {
@@ -271,7 +283,7 @@ const conditionSchema = { type: 'object', required: ['left', 'op', 'right'], add
   properties: { left: {}, op: { enum: ['eq', 'ne', 'contains', 'gt', 'gte', 'lt', 'lte'] }, right: {} } };
 export const FLOW_TOOL = {
   name: 'omega_flow',
-  description: 'Bounded JSON micro-runtime composing omega tools. Actions start/status/cancel; 1..32 sequential tool/set/assert/awaitBatch steps. Typed refs, no interpolation/eval/action retries: "vars.x" for inputs; "steps.id.text" is ALWAYS present on a tool step; "steps.id.data" exists on set/assert steps, and on a tool step only when the tool returned a data payload or the step set parseJson:true (a tool that returns neither has .text only, so steps.id.data is a "missing ref" error). when uses {left,op,right}. awaitBatch:{id,timeoutMs?} observes an existing batch until success, default120000/max600000ms; never relaunches it. Defaults to read-only; effect tools require OMEGA_FLOW_ALLOW_EFFECTS=1 AND request allowEffects. MCP checks only omega_flow permission, not nested tool permissions; original guards still apply. Launch alone is NOT success. waitMs max50000 controls response waiting, not execution deadline. Results expose handles, active step and failure codes even without verbose. Memory-only, retained30min, max16. Cancel stops future steps/status polls, not current tools or launched batches. No automatic rollback. outputs resolve only on success; verbose returns full retained step results.',
+  description: 'Bounded JSON micro-runtime composing omega tools. Actions start/status/cancel; 1..32 sequential tool/set/assert/awaitBatch steps. Typed refs, no interpolation/eval/action retries: "vars.x" for inputs; "steps.id.text" is ALWAYS present on a tool step; "steps.id.data" exists on set/assert steps, and on a tool step only when the tool returned a data payload or the step set parseJson:true (a tool that returns neither has .text only, so steps.id.data is a "missing ref" error). when uses {left,op,right}. awaitBatch:{id,timeoutMs?} observes an existing batch until success, default120000/max600000ms; never relaunches it. Defaults to read-only; effect tools require OMEGA_FLOW_ALLOW_EFFECTS=1 AND request allowEffects. MCP checks only omega_flow permission, not nested tool permissions; original guards still apply. Launch alone is NOT success. waitMs max50000 controls response waiting, not execution deadline. Results expose handles, active step and failure codes even without verbose. Memory-only, retained30min, capacity is OMEGA_FLOW_MAX_JOBS (default 16). Cancel stops future steps, does NOT kill a running tool or a launched batch, and frees its capacity slot once the flow stops -- a cancelled flow is no longer queryable by id, its final snapshot comes back in the cancel response. No automatic rollback. outputs resolve only on success; verbose returns full retained step results.',
   inputSchema: { type: 'object', additionalProperties: false, properties: {
     action: { enum: ['start', 'status', 'cancel'] }, id: { type: 'string' },
     vars: { type: 'object', additionalProperties: true },
