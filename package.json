@@ -7,8 +7,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node batch-guard.test.mjs && node tools-ext.test.mjs",
+    "test": "node batch-guard.test.mjs && node tools-ext.test.mjs && node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs",
     "test:guard": "node batch-guard.test.mjs",
-    "test:tools": "node tools-ext.test.mjs"
+    "test:tools": "node tools-ext.test.mjs",
+    "test:flow": "node omega-flow.test.mjs && node omega-flow.round2.test.mjs && node omega-flow-wait.test.mjs"
   }
 }

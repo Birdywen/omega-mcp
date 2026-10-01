@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createFlowRuntime } from './omega-flow.mjs';
+import { createFlowRuntime, FLOW_TOOL } from './omega-flow.mjs';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -151,4 +151,58 @@ test('MCP wire advertises flow alongside old tools, with read-only default', asy
     const old = await request('tools/call', { name: 'omega_read', arguments: { path: file } });
     assert.equal(old.result.content[0].text, JSON.parse(r.result.content[0].text).outputs);
   } finally { lines.close(); child.kill(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('ref contract: tool step is .text, .data only when the tool returned one or parseJson is set', async () => {
+  // A tool returning neither data nor parseJson must expose .text ONLY.
+  // This is the trap: the advertised description used to promise steps.id.data
+  // for every step, so a flow written from the docs failed with "missing ref".
+  const bare = createFlowRuntime(async () => ({ isError: false, text: 'BARE' }));
+  const r1 = await bare({ steps: [
+    { id: 'tool', tool: 'omega_read' },
+    { id: 'ok', assert: { left: ref('steps.tool.text'), op: 'eq', right: 'BARE' } },
+  ], outputs: ref('steps.tool.text') });
+  assert.equal(r1.data.state, 'success');
+  assert.equal(r1.data.outputs, 'BARE');
+  const bad = await bare({ steps: [
+    { id: 'tool', tool: 'omega_read' },
+    { id: 'nope', assert: { left: ref('steps.tool.data'), op: 'eq', right: 'BARE' } },
+  ] });
+  assert.equal(bad.data.state, 'failed');
+  assert.equal(bad.data.failure.code, 'resolve');
+  assert.match(bad.data.failure.error, /missing ref: steps\.tool\.data/);
+
+  // parseJson promotes parsed text to .data
+  const parsed = createFlowRuntime(async () => ({ isError: false, text: '{"n":7}' }));
+  const r2 = await parsed({ steps: [
+    { id: 'tool', tool: 'omega_read', parseJson: true },
+    { id: 'ok', assert: check(ref('steps.tool.data.n'), 7) },
+  ] });
+  assert.equal(r2.data.state, 'success');
+
+  // a tool that DOES return a data payload exposes it without parseJson.
+  // Must be a READ tool: effect tools are rejected at preflight regardless of dispatch.
+  const withData = createFlowRuntime(async () => ({ isError: false, text: 'x', data: { jobId: 'J1' } }));
+  const r3 = await withData({ steps: [
+    { id: 'tool', tool: 'omega_health' },
+    { id: 'ok', assert: check(ref('steps.tool.data.jobId'), 'J1') },
+  ] });
+  assert.equal(r3.data.state, 'success');
+
+  // set and assert steps always expose .data
+  const r4 = await bare({ steps: [
+    { id: 's', set: 'literal' },
+    { id: 'a', assert: check(ref('steps.s.data'), 'literal') },
+    { id: 'done', assert: check(ref('steps.a.data'), true) },
+  ] });
+  assert.equal(r4.data.state, 'success');
+});
+
+test('advertised description documents the real ref contract', () => {
+  // Guards the doc/contract drift directly: the MCP description is what the
+  // model reads, so a wrong example here is a real production bug.
+  const d = FLOW_TOOL.description;
+  assert.match(d, /steps\.id\.text/);
+  assert.match(d, /parseJson/);
+  assert.doesNotMatch(d, /steps\.id\.data"\}\s*;\s*no interpolation/);
 });
