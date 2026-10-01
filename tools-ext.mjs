@@ -842,6 +842,24 @@ export function omegaGrep(args, opts = {}) {
   const asList = (value) => value === undefined ? [] : (Array.isArray(value) ? value : [value]);
   const includes = asList(args.include).filter((v) => typeof v === 'string' && v);
   const excludes = asList(args.exclude).filter((v) => typeof v === 'string' && v);
+  // 2026-10-01: searching $HOME failed two ways at once. TCC-protected trees
+  // (Photos Library, Library/Caches, ...) made rg exit 2, and omegaGrep treated
+  // any exit >=2 as a hard error -- so one unreadable subtree DISCARDED an
+  // otherwise complete result set. Measured: the same search over /Users/yay did
+  // not finish in 120s; with these excludes it returns in 0.05s.
+  //
+  // Two independent fixes, both needed. (1) Never walk the OS media/library
+  // trees -- they hold no source and are the only TCC-blocked paths in practice.
+  // (2) exit 2 must not discard results (see the close handler below): rg reports
+  // "found matches AND hit unreadable dirs" as 2, which is a partial success, not
+  // a failure. Default excludes alone would not have fixed a stray chmod 000 dir
+  // inside a normal tree.
+  //
+  // Opt out with OMEGA_GREP_NO_DEFAULT_EXCLUDES=1 when a search really must
+  // descend into those trees (e.g. auditing a Photos backup).
+  const defaultExcludes = process.env.OMEGA_GREP_NO_DEFAULT_EXCLUDES === '1'
+    ? []
+    : ['Library/**', 'Pictures/**', 'Music/**', 'Movies/**', '.Trash/**'];
   return new Promise((resolve) => {
     let useRg = false;
     // OMEGA_FORCE_GREP=1 exercises the fallback on a host that has rg. The two
@@ -863,6 +881,7 @@ export function omegaGrep(args, opts = {}) {
       if (after) cmdArgs.push('-A', String(after));
       for (const include of includes) cmdArgs.push('--glob', include);
       for (const exclude of excludes) cmdArgs.push('--glob', `!${exclude}`);
+      for (const exclude of defaultExcludes) cmdArgs.push('--glob', `!${exclude}`);
       cmdArgs.push('--', dir);
       cmd = 'rg';
     } else {
@@ -887,6 +906,12 @@ export function omegaGrep(args, opts = {}) {
       if (before) cmdArgs.push('-B', String(before));
       if (after) cmdArgs.push('-A', String(after));
       for (const include of includes) cmdArgs.push(`--include=${include}`);
+      for (const exclude of defaultExcludes) {
+        // grep has no `--exclude=X/**` form, so exclude the tree by its top
+        // component name -- the same set rg skips via the glob above.
+        const name = exclude.replace(/\/\*\*.*$/, '').split('/').filter(Boolean).pop();
+        if (name) cmdArgs.push(`--exclude-dir=${name}`);
+      }
       for (const exclude of excludes) {
         cmdArgs.push(`--exclude=${exclude}`);
         const dirPattern = exclude.replace(/\/\*\*.*$/, '').split('/').filter(Boolean).pop();
@@ -932,7 +957,22 @@ export function omegaGrep(args, opts = {}) {
         return;
       }
       // Both rg and grep use 1 for a clean no-match result and 2+ for errors.
-      if (code !== 0 && code !== 1) {
+      // But 2 ALSO means "read what it could AND some paths were unreadable"
+      // (rg: permission/TCC/symlink-loop; grep -rn: same). Throwing that away
+      // loses real matches -- which is why a $HOME search used to return nothing
+      // at all. Fixture-verified: rg exits 2 whether or not it matched anything.
+      //
+      // Exit 2 must therefore be classified, not blanket-treated as failure:
+      //   - unreadable paths + (matches or none) -> report, do not error. The
+      //     caller gets real results plus a PARTIAL label.
+      //   - anything else, e.g. an invalid regex (also exit 2, also no output) ->
+      //     stay a hard error, because "no matches" there would be a lie.
+      // Keying on stderr rather than on output length is what keeps the second
+      // case an error; keying on output length alone masked bad patterns.
+      const producedOutput = out.trim().length > 0;
+      const unreadablePaths = /permission denied|operation not permitted|too many levels of symbolic links|os error (1|13)\b/i.test(err);
+      const partialWalk = code === 2 && (producedOutput || unreadablePaths);
+      if (code !== 0 && code !== 1 && !partialWalk) {
         finish({
           isError: true,
           text: `omega_grep failed via ${cmd} (exit ${code}${signal ? `, signal ${signal}` : ''}) in ${dir}\n${err.slice(0, 1000) || '(no stderr)'}`,
@@ -952,7 +992,13 @@ export function omegaGrep(args, opts = {}) {
       const text = lines.map((l) => l.slice(0, maxLineLength)).join('\n').slice(0, GREP_TOTAL_CAP);
       const truncated = captureTruncated || availableMatches > max || text.length >= GREP_TOTAL_CAP;
       const context = before || after ? `, context -B${before} -A${after}` : '';
-      const summary = `omega_grep: ${matches} match(es)${truncated ? ' (truncated, narrow pattern/dir)' : ''}${context} via ${cmd} in ${dir}`;
+      // Never let a partial walk pass for a complete one: say which paths were
+      // skipped so the caller can narrow the search instead of trusting the cap.
+      const partial = partialWalk
+        ? ' [PARTIAL: some paths were unreadable (permissions/symlink loop) and were skipped'
+          + `${defaultExcludes.length && process.env.OMEGA_GREP_NO_DEFAULT_EXCLUDES !== '1' ? `; skipped default trees: ${defaultExcludes.join(', ')}` : ''}]`
+        : '';
+      const summary = `omega_grep: ${matches} match(es)${truncated ? ' (truncated, narrow pattern/dir)' : ''}${context} via ${cmd} in ${dir}${partial}`;
       finish({ isError: false, text: `${summary}\n\n${text || '(no matches)'}` });
     });
     child.on('error', (e) => { clearTimeout(t); finish({ isError: true, text: e.message }); });
