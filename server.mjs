@@ -209,7 +209,27 @@ const TOOLS = [
 const OMEGA_ADVERTISE = new Set(["omega_batch", "omega_batch_status", "omega_batch_cancel", "omega_read", "artifact_read", "artifact_search", "db_query", "omega_guard_check", "omega_grep", "omega_quota", "omega_health", "vfs_local_write", "omega_sqlite", "omega_edit", "omega_undo"]);
 OMEGA_ADVERTISE.add('omega_flow');
 const ALL_TOOLS = [...TOOLS, ...EXTRA_TOOLS, FLOW_TOOL].filter((t) => OMEGA_ADVERTISE.has(t.name));
-const omegaFlow = createFlowRuntime(callTool, { allowEffects: process.env.OMEGA_FLOW_ALLOW_EFFECTS === '1' });
+// Flow capacity is bounded so a chatty model cannot grow the jobs map without
+// limit. Jobs are only reclaimed by the 30-minute TTL sweep and cancel does NOT
+// free a slot, so a session that opens maxJobs flows is locked out until they
+// expire. OMEGA_FLOW_MAX_JOBS tunes the ceiling; an unparseable value falls back
+// to the default rather than silently lifting the bound.
+const FLOW_MAX_JOBS_DEFAULT = 16;
+const FLOW_MAX_JOBS_LIMIT = 1024;
+const flowMaxJobs = (() => {
+  const raw = process.env.OMEGA_FLOW_MAX_JOBS;
+  if (raw === undefined || raw === '') return FLOW_MAX_JOBS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > FLOW_MAX_JOBS_LIMIT) {
+    log(`omega_flow: ignoring OMEGA_FLOW_MAX_JOBS=${JSON.stringify(raw)}; want an integer 1..${FLOW_MAX_JOBS_LIMIT}`);
+    return FLOW_MAX_JOBS_DEFAULT;
+  }
+  return n;
+})();
+const omegaFlow = createFlowRuntime(callTool, {
+  allowEffects: process.env.OMEGA_FLOW_ALLOW_EFFECTS === '1',
+  maxJobs: flowMaxJobs,
+});
 
 async function callTool(name, args) {
   if (name === 'omega_flow') return omegaFlow(args || {});

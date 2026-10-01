@@ -206,3 +206,56 @@ test('advertised description documents the real ref contract', () => {
   assert.match(d, /parseJson/);
   assert.doesNotMatch(d, /steps\.id\.data"\}\s*;\s*no interpolation/);
 });
+
+// Spawns the real MCP server and returns a tools/call helper.
+const wire = (env) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'omega-flow-cap-'));
+  const child = spawn(process.execPath, [new URL('./server.mjs', import.meta.url).pathname], {
+    env: { ...process.env, OMEGA_MCP_LOG: path.join(dir, 'log'), ...env }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const pending = new Map(); let id = 0;
+  const lines = createInterface({ input: child.stdout });
+  lines.on('line', (line) => { const m = JSON.parse(line); pending.get(m.id)?.(m); });
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const key = ++id;
+    const timer = setTimeout(() => reject(Error('MCP response timed out')), 10000);
+    pending.set(key, (value) => { clearTimeout(timer); pending.delete(key); resolve(value); });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: key, method, params }) + '\n');
+  });
+  const startFlow = (n) => request('tools/call', { name: 'omega_flow', arguments: {
+    steps: [{ id: 'a', tool: 'omega_health' }], waitMs: 5000,
+  } }).then((r) => JSON.parse(r.result.content[0].text));
+  return { startFlow, close: () => { lines.close(); child.kill(); rmSync(dir, { recursive: true, force: true }); } };
+};
+
+test('OMEGA_FLOW_MAX_JOBS tunes flow capacity, and a bad value falls back to 16', async () => {
+  // Tuned down: capacity must actually move, not just be accepted.
+  const small = wire({ OMEGA_FLOW_MAX_JOBS: '2' });
+  try {
+    assert.equal((await small.startFlow()).state, 'success');
+    assert.equal((await small.startFlow()).state, 'success');
+    const third = await small.startFlow();
+    assert.equal(third.state, 'rejected');
+    assert.match(third.error, /capacity reached/);
+  } finally { small.close(); }
+
+  // Invalid values must NOT lift the bound silently -- fall back to 16.
+  for (const bad of ['0', '-1', 'abc', '1.5', '99999', ' ']) {
+    const w = wire({ OMEGA_FLOW_MAX_JOBS: bad });
+    try {
+      const states = [];
+      for (let i = 0; i < 17; i++) states.push((await w.startFlow()).state);
+      assert.equal(states.slice(0, 16).every((s) => s === 'success'), true, `bad=${JSON.stringify(bad)} ${states.slice(15).join()}`);
+      assert.equal(states[16], 'rejected', `bad=${JSON.stringify(bad)}`);
+    } finally { w.close(); }
+  }
+
+  // Unset keeps the documented default of 16.
+  const unset = wire({ OMEGA_FLOW_MAX_JOBS: '' });
+  try {
+    const states = [];
+    for (let i = 0; i < 17; i++) states.push((await unset.startFlow()).state);
+    assert.equal(states.slice(0, 16).every((s) => s === 'success'), true);
+    assert.equal(states[16], 'rejected');
+  } finally { unset.close(); }
+});
