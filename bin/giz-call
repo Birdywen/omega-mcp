@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""giz-call TOOL [JSON]
+
+Run one Giz MCP tool through `giz invoke` and print only what matters.
+Input JSON comes from the second argument or stdin. The full response is
+saved under $GIZ_CALL_DIR (default /tmp/giz-calls). The last line is
+GIZ_CALL_OK or GIZ_CALL_FAIL, and the exit code matches (0 / 1, 2 = usage).
+media_probe with passed=false counts as a failure.
+"""
+import json, os, subprocess, sys, time
+
+G = os.environ.get('GIZ_BIN', '/opt/homebrew/bin/giz')
+OUT = os.environ.get('GIZ_CALL_DIR', '/tmp/giz-calls')
+TIMEOUT = int(os.environ.get('GIZ_CALL_TIMEOUT', '900'))
+KEYS = ('passed', 'failures', 'outputPath', 'path', 'duration', 'width', 'height',
+        'jobId', 'status', 'url', 'artifactUrl')
+
+
+def pick(d):
+    found = {}
+    for src in (d, d.get('result') if isinstance(d.get('result'), dict) else None):
+        if isinstance(src, dict):
+            for k in KEYS:
+                if k in src and k not in found:
+                    found[k] = src[k]
+    return found
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 2
+    tool = sys.argv[1]
+    raw = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
+    try:
+        args = json.loads(raw.strip() or '{}')
+    except Exception as e:
+        print('error: input is not valid JSON: %s' % e)
+        print('GIZ_CALL_FAIL')
+        return 1
+    os.makedirs(OUT, exist_ok=True)
+    full = os.path.join(OUT, '%s-%s.json' % (time.strftime('%Y%m%d-%H%M%S'), tool))
+    try:
+        p = subprocess.run([G, 'invoke', tool, '--input', json.dumps(args), '--json'],
+                           capture_output=True, text=True, timeout=TIMEOUT)
+        rc, body = p.returncode, (p.stdout.strip() or p.stderr.strip())
+    except subprocess.TimeoutExpired:
+        rc, body = 124, '{"error": {"message": "giz-call timed out after %ds"}}' % TIMEOUT
+    open(full, 'w', encoding='utf-8').write(body)
+    try:
+        data = json.loads(body)
+    except Exception:
+        data = None
+    print('tool=%s rc=%d' % (tool, rc))
+    ok = rc == 0
+    if isinstance(data, dict):
+        err = data.get('error')
+        if err:
+            ok = False
+            if isinstance(err, dict):
+                print('error: ' + str(err.get('message', ''))[:400])
+                if err.get('hint'):
+                    print('hint: ' + str(err['hint'])[:200])
+            else:
+                print('error: ' + str(err)[:400])
+        for k, v in pick(data).items():
+            print('%s: %s' % (k, json.dumps(v, ensure_ascii=False)[:400]))
+        if pick(data).get('passed') is False:
+            ok = False
+    else:
+        print('raw: ' + body[:400].replace(chr(10), ' '))
+    print('full: ' + full)
+    print('GIZ_CALL_OK' if ok else 'GIZ_CALL_FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
